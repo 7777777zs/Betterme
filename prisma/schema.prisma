@@ -1,0 +1,305 @@
+// ---------------------------------------------------------------------------
+// BetterMe · 健康测评系统 · 数据模型
+//
+// 设计原则：
+// 1. 作答不塞进一个大 JSON 字段。每一步单独成行（quiz_answers），
+//    新增测评步骤时不需要改表结构，也能对单步做唯一约束与幂等 upsert。
+// 2. 所有会改变外部可见状态的写入都留痕：作答有 quiz_answer_events，
+//    支付有 payment_events。出问题时能回放，而不是只能看当前快照。
+// 3. 幂等与并发是一等公民：会话有乐观锁 version，支付回调有唯一幂等键。
+// 4. 受保护字段（weeklyProjection / targetDate）集中在 assessment_results，
+//    序列化层按订阅状态决定是否投影出来。
+// ---------------------------------------------------------------------------
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// 枚举
+// ---------------------------------------------------------------------------
+
+/// 测评会话状态机：IN_PROGRESS -> COMPLETED，或超时后 -> ABANDONED
+enum SessionStatus {
+  IN_PROGRESS
+  COMPLETED
+  ABANDONED
+}
+
+/// 用户输入的单位制。英制在入口层统一换算为公制后入库，
+/// 库里只存公制，避免同一列出现两种量纲。
+enum UnitSystem {
+  METRIC
+  IMPERIAL
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+/// 减重 / 维持 / 增肌，决定热量缺口方向
+enum FitnessGoal {
+  LOSE_WEIGHT
+  MAINTAIN_WEIGHT
+  GAIN_MUSCLE
+}
+
+/// 运动频率，映射到 TDEE 活动系数
+enum ActivityLevel {
+  SEDENTARY
+  LIGHT
+  MODERATE
+  VERY_ACTIVE
+}
+
+enum SubscriptionStatus {
+  NONE
+  ACTIVE
+  EXPIRED
+  CANCELED
+}
+
+/// 支付事件类型。用事件类型而非布尔字段，
+/// 日后接退款 / 续费不需要改表。
+enum PaymentEventType {
+  CHECKOUT_COMPLETED
+  SUBSCRIPTION_RENEWED
+  REFUNDED
+}
+
+// ---------------------------------------------------------------------------
+// 用户
+// ---------------------------------------------------------------------------
+
+/// 匿名用户。题目允许「随机 UserID 或简易 Session 识别」，
+/// 但建成正式的 users 表才有扩展空间：接真实登录时只需补 email / authProvider，
+/// 已有的会话和订阅数据不用迁移。
+model User {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// 客户端持有明文 token，服务端只存 SHA-256 摘要。
+  /// 即使数据库泄漏，攻击者也无法直接冒充用户读取结果页。
+  anonTokenHash String @unique @map("anon_token_hash") @db.Char(64)
+
+  /// 预留给后续真实注册流程
+  email String? @unique @db.VarChar(320)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  sessions      QuizSession[]
+  subscription  Subscription?
+  paymentEvents PaymentEvent[]
+
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// 测评会话
+// ---------------------------------------------------------------------------
+
+/// 一次测评会话，进度恢复的锚点。对外暴露的 sessionId 就是这里的 id。
+model QuizSession {
+  id String @id @default(uuid()) @db.Uuid
+
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  status SessionStatus @default(IN_PROGRESS)
+
+  /// 恢复时前端直接跳到这一步，不用自己推算
+  currentStep String? @map("current_step") @db.VarChar(64)
+
+  /// 用户输入时用的单位制，仅用于回显；数值本身一律公制
+  unitSystem UnitSystem @default(METRIC) @map("unit_system")
+
+  /// 乐观锁。每次写入 +1，客户端 PATCH 时带上 If-Match。
+  /// 版本不符返回 409 而不是静默覆盖，这是并发更新正确性的核心。
+  version Int @default(0)
+
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(3)
+
+  /// 会话过期时间，过期会话拒绝写入并可被后台标记为 ABANDONED
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  answers      QuizAnswer[]
+  answerEvents QuizAnswerEvent[]
+  result       AssessmentResult?
+
+  @@index([userId, status])
+  @@index([status, expiresAt])
+  @@map("quiz_sessions")
+}
+
+/// 单步作答的「当前值」。(sessionId, stepKey) 唯一，
+/// 重复提交走 upsert，天然幂等；乱序提交也不会互相覆盖。
+model QuizAnswer {
+  id String @id @default(uuid()) @db.Uuid
+
+  sessionId String      @map("session_id") @db.Uuid
+  session   QuizSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  /// 步骤标识，如 gender / goal / body_metrics / activity_level
+  stepKey String @map("step_key") @db.VarChar(64)
+
+  /// 已经过 zod 校验并规范化的值。用 jsonb 而不是宽表，
+  /// 是因为每步的字段形状不同，且步骤集合会随产品迭代增删。
+  value Json @db.JsonB
+
+  /// 该步被覆盖过几次。用户改主意回头修改时递增。
+  revision Int @default(1)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([sessionId, stepKey])
+  @@index([sessionId])
+  @@map("quiz_answers")
+}
+
+/// 只增不改的作答流水。每次写入 quiz_answers 都追加一行。
+/// 用途：重复 / 乱序提交可追溯，也为后续的漏斗流失分析留下原始数据。
+model QuizAnswerEvent {
+  id BigInt @id @default(autoincrement())
+
+  sessionId String      @map("session_id") @db.Uuid
+  session   QuizSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  stepKey  String @map("step_key") @db.VarChar(64)
+  value    Json   @db.JsonB
+  revision Int
+
+  /// 写入时会话的版本号，方便和 quiz_sessions.version 对齐排查并发问题
+  sessionVersion Int @map("session_version")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([sessionId, createdAt])
+  @@map("quiz_answer_events")
+}
+
+// ---------------------------------------------------------------------------
+// 算法结果
+// ---------------------------------------------------------------------------
+
+/// 服务端健康评估算法的产物，与会话一对一。
+/// 独立成表而不是塞回 quiz_sessions，是因为它的生命周期不同：
+/// 会话可以反复修改，结果是某个时刻算法的一次快照。
+model AssessmentResult {
+  id String @id @default(uuid()) @db.Uuid
+
+  sessionId String      @unique @map("session_id") @db.Uuid
+  session   QuizSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  // --- 免费可见 ---
+
+  /// 用 Decimal 而非 Float，避免浮点漂移导致同样输入两次算出不同字符串
+  bmi         Decimal @db.Decimal(5, 2)
+  bmiCategory String  @map("bmi_category") @db.VarChar(32)
+
+  /// 基础代谢率，Mifflin-St Jeor
+  bmr Int
+
+  /// 每日总消耗 = BMR × 活动系数
+  tdee Int
+
+  /// 建议每日摄入，已施加安全下限钳制
+  recommendedCalories Int @map("recommended_calories")
+
+  proteinG Int @map("protein_g")
+  carbsG   Int @map("carbs_g")
+  fatG     Int @map("fat_g")
+
+  /// 目标不合理时的告警，如目标 BMI 过低。
+  /// 选择返回告警而不是直接报错，是为了不打断漏斗，同时不假装这个目标健康。
+  warnings Json @default("[]") @db.JsonB
+
+  // --- 付费可见（非会员响应里这些字段整个不出现） ---
+
+  /// 达成目标体重的预测日期
+  targetDate DateTime? @map("target_date") @db.Date
+
+  /// 逐周体重预测曲线，结果页的核心付费价值
+  weeklyProjection Json @map("weekly_projection") @db.JsonB
+
+  /// 算法版本号。结果可复现、可回溯；算法迭代后老结果不会被误判为 bug。
+  algorithmVersion String @map("algorithm_version") @db.VarChar(16)
+
+  computedAt DateTime @default(now()) @map("computed_at") @db.Timestamptz(3)
+
+  @@map("assessment_results")
+}
+
+// ---------------------------------------------------------------------------
+// 订阅与支付
+// ---------------------------------------------------------------------------
+
+/// 用户的订阅状态。与 users 一对一。
+/// 是否为会员由 status 与 currentPeriodEnd 共同决定，
+/// 只看 status 会漏掉「状态还是 ACTIVE 但周期已过」的情况。
+model Subscription {
+  id String @id @default(uuid()) @db.Uuid
+
+  userId String @unique @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  status SubscriptionStatus @default(NONE)
+
+  plan String? @db.VarChar(32)
+
+  currentPeriodStart DateTime? @map("current_period_start") @db.Timestamptz(3)
+  currentPeriodEnd   DateTime? @map("current_period_end") @db.Timestamptz(3)
+
+  activatedAt DateTime? @map("activated_at") @db.Timestamptz(3)
+  canceledAt  DateTime? @map("canceled_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@index([status, currentPeriodEnd])
+  @@map("subscriptions")
+}
+
+/// 支付回调流水，append-only。
+/// idempotencyKey 唯一约束是防重放的关键：同一笔回调被网关重发多次，
+/// 只有第一次会真正开通会员，后续插入直接撞唯一约束。
+model PaymentEvent {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// 支付网关提供的幂等键。真实场景由网关下发，这里由调用方传入或服务端生成。
+  idempotencyKey String @unique @map("idempotency_key") @db.VarChar(128)
+
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// 关联到触发支付的那次测评会话，便于归因
+  sessionId String? @map("session_id") @db.Uuid
+
+  provider  String           @default("mock") @db.VarChar(32)
+  eventType PaymentEventType @map("event_type")
+
+  /// 金额用整数分存储，绝不用浮点存钱
+  amountCents Int    @map("amount_cents")
+  currency    String @default("USD") @db.Char(3)
+
+  /// 原始回调报文，留档用于对账
+  rawPayload Json @map("raw_payload") @db.JsonB
+
+  /// 处理完成时间。为空表示收到了但还没成功处理，可被重试任务捞起。
+  processedAt DateTime? @map("processed_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([userId, createdAt])
+  @@map("payment_events")
+}
