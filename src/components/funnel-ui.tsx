@@ -27,6 +27,79 @@ export function ProgressBar({ percent }: { percent: number }) {
   );
 }
 
+/**
+ * 返回键。
+ *
+ * 保存过程中禁用：PATCH 还在飞的时候切走，界面显示的步骤会和
+ * 服务端刚刚递增的版本号对不上，下一次保存就会撞版本冲突。
+ */
+export function BackButton({
+  onClick,
+  disabled,
+  label = "返回上一步",
+}: {
+  onClick: () => void;
+  disabled?: boolean;
+  label?: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={label}
+      className="-ml-2 flex items-center gap-1 rounded-full px-2 py-1 text-sm text-ink-faint transition-colors hover:text-ink-soft disabled:cursor-not-allowed disabled:opacity-40"
+    >
+      <svg viewBox="0 0 20 20" aria-hidden className="size-4 fill-none stroke-current stroke-2">
+        <path d="M12 15l-5-5 5-5" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+      返回
+    </button>
+  );
+}
+
+/**
+ * 进度恢复的提示条。
+ *
+ * 恢复功能如果是隐形的，用户的体感是「这网页记住了我，还不让我重来」。
+ * 明确说出来，并且给一个退出口，同一个功能就从困扰变成了贴心。
+ */
+export function ResumeNotice({
+  onRestart,
+  onDismiss,
+  restarting,
+}: {
+  onRestart: () => void;
+  onDismiss: () => void;
+  restarting?: boolean;
+}) {
+  return (
+    <div className="mb-6 flex items-center justify-between gap-3 rounded-xl border border-line bg-accent-soft px-4 py-3">
+      <p className="text-sm text-ink-soft">已恢复你上次填写的进度</p>
+      <span className="flex shrink-0 items-center gap-3">
+        <button
+          type="button"
+          onClick={onRestart}
+          disabled={restarting}
+          className="text-sm font-medium text-accent underline underline-offset-2 transition-opacity hover:opacity-70 disabled:opacity-40"
+        >
+          {restarting ? "处理中…" : "重新开始"}
+        </button>
+        <button
+          type="button"
+          onClick={onDismiss}
+          aria-label="关闭提示"
+          className="text-ink-faint transition-colors hover:text-ink-soft"
+        >
+          <svg viewBox="0 0 20 20" aria-hidden className="size-4 fill-none stroke-current stroke-2">
+            <path d="M5 5l10 10M15 5L5 15" strokeLinecap="round" />
+          </svg>
+        </button>
+      </span>
+    </div>
+  );
+}
+
 export function StepHeading({
   title,
   subtitle,

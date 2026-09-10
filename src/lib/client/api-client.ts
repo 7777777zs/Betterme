@@ -234,6 +234,18 @@ export const api = {
     return data;
   },
 
+  /**
+   * 主动作废一次未完成的测评。用户点「重新开始」时调用。
+   * 失败不该挡住用户重来，所以调用方通常会吞掉这里的异常。
+   */
+  async abandon(session: StoredSession): Promise<{ status: string; changed: boolean }> {
+    const { data } = await request<{ status: string; changed: boolean }>(
+      `/api/v1/sessions/${session.sessionId}/abandon`,
+      { method: "POST", token: session.token },
+    );
+    return data;
+  },
+
   async submit(session: StoredSession): Promise<{ resultId: string }> {
     const { data } = await request<{ resultId: string }>(
       `/api/v1/sessions/${session.sessionId}/submit`,

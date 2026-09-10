@@ -10,13 +10,22 @@ import {
   saveSession,
   type StoredSession,
 } from "@/lib/client/api-client";
-import type { StepKey } from "@/lib/quiz/steps";
 import {
+  STEP_KEYS,
+  type StepKey,
+  resumeStepFor,
+  stepAtIndex,
+  stepIndexOf,
+  stepProgressPercent,
+} from "@/lib/quiz/steps";
+import {
+  BackButton,
   ErrorBanner,
   NumberField,
   OptionCard,
   PrimaryButton,
   ProgressBar,
+  ResumeNotice,
   StepHeading,
   TrustNote,
 } from "@/components/funnel-ui";
@@ -24,11 +33,16 @@ import {
 /**
  * 测评漏斗。
  *
- * 状态机很简单：booting -> 某个步骤 -> submitting -> 跳转结果页。
+ * 导航是下标驱动的向导：位置由 stepIndex 决定，前进就是加一、返回就是减一。
+ * 之前用的是「跳到第一个没答的步骤」，那个规则没法表达「回头改一个已答过的答案」——
+ * 一保存就会被弹回最前面的空缺处。
  *
- * 「进度恢复」在这里落地：进页面时先看 localStorage 有没有会话，
- * 有就调恢复接口把已填答案灌回表单，并跳到第一个没答的步骤。
- * 用户中途关掉标签页、手机息屏、误触返回，回来都能接着填。
+ * 步骤顺序、恢复落点、进度百分比全部来自 src/lib/quiz/steps.ts 的纯函数，
+ * 组件里不再自己维护一份步骤数组。那些函数有单测，这里没有。
+ *
+ * 「进度恢复」在这里落地：进页面先看 localStorage 有没有会话，
+ * 有就调恢复接口把已填答案灌回表单，并停在他上次的进度处。
+ * 恢复不是隐形的 —— 顶部会明说，并且给一个「重新开始」的退出口。
  *
  * 「乐观锁」也在这里落地：每次保存都带上服务端回传的版本号。
  * 同一个人开两个标签页填同一份问卷是真实会发生的，
@@ -43,14 +57,6 @@ interface BodyForm {
   weight: string;
   goalWeight: string;
 }
-
-const STEP_ORDER: StepKey[] = [
-  "gender",
-  "goal",
-  "focus_areas",
-  "body_metrics",
-  "activity_level",
-];
 
 const GENDERS = [
   { value: "MALE", label: "男性" },
@@ -80,27 +86,24 @@ const ACTIVITY_LEVELS = [
   { value: "VERY_ACTIVE", label: "每周 6 次以上", hint: "高强度训练" },
 ] as const;
 
+const EMPTY_BODY: BodyForm = { age: "", height: "", weight: "", goalWeight: "" };
+
 export default function QuizPage() {
   const router = useRouter();
 
   const [uiState, setUiState] = useState<UiState>("booting");
   const [session, setSession] = useState<StoredSession | null>(null);
   const [version, setVersion] = useState(0);
-  const [currentStep, setCurrentStep] = useState<StepKey>("gender");
-  const [progress, setProgress] = useState(0);
-  const [answered, setAnswered] = useState<Set<StepKey>>(new Set());
+  const [stepIndex, setStepIndex] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [resumed, setResumed] = useState(false);
+  const [restarting, setRestarting] = useState(false);
 
   const [gender, setGender] = useState<string | null>(null);
   const [goal, setGoal] = useState<string | null>(null);
   const [areas, setAreas] = useState<string[]>([]);
   const [activity, setActivity] = useState<string | null>(null);
-  const [body, setBody] = useState<BodyForm>({
-    age: "",
-    height: "",
-    weight: "",
-    goalWeight: "",
-  });
+  const [body, setBody] = useState<BodyForm>(EMPTY_BODY);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
 
   // 严格模式下 effect 会跑两次，没有这道闸会创建两个会话
@@ -108,29 +111,44 @@ export default function QuizPage() {
 
   function hydrateFromAnswers(answers: Record<string, unknown>): void {
     const g = answers.gender as { gender?: string } | undefined;
-    if (g?.gender) setGender(g.gender);
+    setGender(g?.gender ?? null);
 
     const go = answers.goal as { goal?: string } | undefined;
-    if (go?.goal) setGoal(go.goal);
+    setGoal(go?.goal ?? null);
 
     const fa = answers.focus_areas as { areas?: string[] } | undefined;
-    if (fa?.areas) setAreas(fa.areas);
+    setAreas(fa?.areas ?? []);
 
     const al = answers.activity_level as { activityLevel?: string } | undefined;
-    if (al?.activityLevel) setActivity(al.activityLevel);
+    setActivity(al?.activityLevel ?? null);
 
     const bm = answers.body_metrics as
       | { age?: number; heightCm?: number; weightKg?: number; goalWeightKg?: number }
       | undefined;
-    if (bm) {
-      setBody({
-        age: bm.age?.toString() ?? "",
-        height: bm.heightCm?.toString() ?? "",
-        weight: bm.weightKg?.toString() ?? "",
-        goalWeight: bm.goalWeightKg?.toString() ?? "",
-      });
-    }
+    setBody(
+      bm
+        ? {
+            age: bm.age?.toString() ?? "",
+            height: bm.heightCm?.toString() ?? "",
+            weight: bm.weightKg?.toString() ?? "",
+            goalWeight: bm.goalWeightKg?.toString() ?? "",
+          }
+        : EMPTY_BODY,
+    );
   }
+
+  const startFreshSession = useCallback(async (): Promise<void> => {
+    const created = await api.createSession();
+    const next = { sessionId: created.sessionId, token: created.token };
+    saveSession(next);
+    setSession(next);
+    setVersion(created.version);
+    setStepIndex(0);
+    setResumed(false);
+    hydrateFromAnswers({});
+    setFieldErrors({});
+    setUiState("ready");
+  }, []);
 
   // ---------------------------------------------------------------------
   // 启动：恢复已有会话，或创建新会话
@@ -152,12 +170,18 @@ export default function QuizPage() {
             return;
           }
 
+          // 上次主动点了「重新开始」但没走完，这次当新用户处理
+          if (state.status === "ABANDONED") {
+            clearSession();
+            await startFreshSession();
+            return;
+          }
+
           hydrateFromAnswers(state.answers);
           setSession(stored);
           setVersion(state.version);
-          setAnswered(new Set(state.answeredSteps));
-          setProgress(state.progressPercent);
-          setCurrentStep(state.currentStep ?? "activity_level");
+          setStepIndex(stepIndexOf(resumeStepFor(state.answeredSteps)));
+          setResumed(state.answeredSteps.length > 0);
           setUiState("ready");
           return;
         } catch (err) {
@@ -171,22 +195,41 @@ export default function QuizPage() {
       }
 
       try {
-        const created = await api.createSession();
-        const next = { sessionId: created.sessionId, token: created.token };
-        saveSession(next);
-        setSession(next);
-        setVersion(created.version);
-        setCurrentStep(created.currentStep ?? "gender");
-        setUiState("ready");
+        await startFreshSession();
       } catch {
         setError("服务暂时不可用，请稍后重试。");
         setUiState("ready");
       }
     })();
-  }, [router]);
+  }, [router, startFreshSession]);
 
   // ---------------------------------------------------------------------
-  // 保存一步并前进
+  // 重新开始
+  // ---------------------------------------------------------------------
+  async function handleRestart(): Promise<void> {
+    setRestarting(true);
+    setError(null);
+
+    try {
+      // 把旧会话标记为 ABANDONED，让它在库里有个明确的归宿，
+      // 而不是变成一条永远停在 IN_PROGRESS 的孤儿记录。
+      if (session) {
+        await api.abandon(session).catch(() => {
+          // 作废失败不该挡住用户重来。旧会话最多是留着过期，
+          // 而用户当下的诉求是「让我重新填」。
+        });
+      }
+      clearSession();
+      await startFreshSession();
+    } catch {
+      setError("无法重新开始，请刷新页面重试。");
+    } finally {
+      setRestarting(false);
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // 保存一步
   // ---------------------------------------------------------------------
   const persist = useCallback(
     async (stepKey: StepKey, value: unknown): Promise<boolean> => {
@@ -199,8 +242,6 @@ export default function QuizPage() {
       try {
         const saved = await api.saveAnswer(session, stepKey, value, version);
         setVersion(saved.version);
-        setProgress(saved.progressPercent);
-        setAnswered(new Set(saved.answeredSteps));
         setUiState("ready");
         return true;
       } catch (err) {
@@ -240,16 +281,25 @@ export default function QuizPage() {
     [session, version],
   );
 
-  function goToNextStep(from: StepKey): void {
-    const nextAnswered = new Set(answered);
-    nextAnswered.add(from);
-    const next = STEP_ORDER.find((key) => !nextAnswered.has(key));
-    if (next) setCurrentStep(next);
+  function goForward(): void {
+    setResumed(false);
+    setStepIndex((index) => Math.min(index + 1, STEP_KEYS.length - 1));
+  }
+
+  function goBack(): void {
+    if (stepIndex === 0) {
+      router.push("/");
+      return;
+    }
+    setError(null);
+    setFieldErrors({});
+    setResumed(false);
+    setStepIndex((index) => index - 1);
   }
 
   async function handleChoice(stepKey: StepKey, value: unknown): Promise<void> {
     const okSaved = await persist(stepKey, value);
-    if (okSaved) goToNextStep(stepKey);
+    if (okSaved) goForward();
   }
 
   // ---------------------------------------------------------------------
@@ -259,15 +309,10 @@ export default function QuizPage() {
     const problems: Record<string, string> = {};
     const num = (raw: string) => (raw.trim() === "" ? Number.NaN : Number(raw));
 
-    const age = num(body.age);
-    const height = num(body.height);
-    const weight = num(body.weight);
-    const goalWeight = num(body.goalWeight);
-
-    if (!Number.isFinite(age)) problems.age = "请输入年龄";
-    if (!Number.isFinite(height)) problems.heightCm = "请输入身高";
-    if (!Number.isFinite(weight)) problems.weightKg = "请输入体重";
-    if (!Number.isFinite(goalWeight)) problems.goalWeightKg = "请输入目标体重";
+    if (!Number.isFinite(num(body.age))) problems.age = "请输入年龄";
+    if (!Number.isFinite(num(body.height))) problems.heightCm = "请输入身高";
+    if (!Number.isFinite(num(body.weight))) problems.weightKg = "请输入体重";
+    if (!Number.isFinite(num(body.goalWeight))) problems.goalWeightKg = "请输入目标体重";
 
     return problems;
   }
@@ -289,7 +334,7 @@ export default function QuizPage() {
       goalWeightKg: Number(body.goalWeight),
     });
 
-    if (okSaved) goToNextStep("body_metrics");
+    if (okSaved) goForward();
   }
 
   async function handleFinalStep(value: string): Promise<void> {
@@ -332,21 +377,33 @@ export default function QuizPage() {
   }
 
   const busy = uiState === "saving";
-  const stepIndex = STEP_ORDER.indexOf(currentStep);
+  const currentStep = stepAtIndex(stepIndex) ?? "gender";
 
   return (
     <main className="mx-auto flex min-h-dvh w-full max-w-xl flex-col px-6 py-8">
       <header className="mb-10">
-        <div className="mb-3 flex items-baseline justify-between text-sm text-ink-faint">
-          <span>
-            第 {stepIndex + 1} 步 / 共 {STEP_ORDER.length} 步
+        <div className="mb-2 flex items-center justify-between">
+          <BackButton
+            onClick={goBack}
+            disabled={busy || restarting}
+            label={stepIndex === 0 ? "返回首页" : "返回上一步"}
+          />
+          <span className="text-sm text-ink-faint">
+            第 {stepIndex + 1} 步 / 共 {STEP_KEYS.length} 步
           </span>
-          <span>{progress}%</span>
         </div>
-        <ProgressBar percent={progress} />
+        <ProgressBar percent={stepProgressPercent(stepIndex)} />
       </header>
 
       <div key={currentStep} className="animate-step-in flex-1">
+        {resumed ? (
+          <ResumeNotice
+            onRestart={() => void handleRestart()}
+            onDismiss={() => setResumed(false)}
+            restarting={restarting}
+          />
+        ) : null}
+
         {error ? <ErrorBanner message={error} /> : null}
 
         {currentStep === "gender" ? (
@@ -426,7 +483,7 @@ export default function QuizPage() {
               </PrimaryButton>
               <button
                 type="button"
-                onClick={() => setCurrentStep("body_metrics")}
+                onClick={goForward}
                 className="w-full py-2 text-sm text-ink-faint transition-colors hover:text-ink-soft"
               >
                 跳过这一步

@@ -10,6 +10,7 @@ const { GET: getSessionRoute } = await import("@/app/api/v1/sessions/[id]/route"
 const { PATCH: saveAnswerRoute } = await import(
   "@/app/api/v1/sessions/[id]/answers/[stepKey]/route"
 );
+const { POST: abandonRoute } = await import("@/app/api/v1/sessions/[id]/abandon/route");
 
 interface CreatedSessionBody {
   sessionId: string;
@@ -75,6 +76,16 @@ function saveAnswer(
           : { "x-session-version": options.ifMatch },
     }),
     { id: session.sessionId, stepKey },
+  );
+}
+
+function abandon(session: CreatedSessionBody, token?: string) {
+  return call<{ status: string; changed: boolean } & ErrorBody>(
+    abandonRoute as never,
+    buildRequest("POST", `/api/v1/sessions/${session.sessionId}/abandon`, {
+      token: token ?? session.token,
+    }),
+    { id: session.sessionId },
   );
 }
 
@@ -508,6 +519,75 @@ describe.skipIf(!hasTestDatabase())("分步保存与进度恢复", () => {
         where: { sessionId: mine.sessionId },
       });
       expect(count).toBe(0);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+
+  describe("主动作废会话", () => {
+    it("作废后状态变为 ABANDONED 并清空当前步骤", async () => {
+      const session = await newSession();
+      await saveAnswer(session, "gender");
+
+      const response = await abandon(session);
+      expect(response.status).toBe(200);
+      expect(response.body.status).toBe("ABANDONED");
+      expect(response.body.changed).toBe(true);
+
+      const stored = await testPrisma().quizSession.findUniqueOrThrow({
+        where: { id: session.sessionId },
+      });
+      expect(stored.status).toBe("ABANDONED");
+      expect(stored.currentStep).toBeNull();
+    });
+
+    it("重复作废是幂等的，不报错", async () => {
+      const session = await newSession();
+      await abandon(session);
+
+      const second = await abandon(session);
+      expect(second.status).toBe(200);
+      expect(second.body.changed).toBe(false);
+    });
+
+    it("已完成的会话拒绝作废", async () => {
+      const session = await newSession();
+      for (const step of ["gender", "goal", "body_metrics", "activity_level"] as const) {
+        await saveAnswer(session, step);
+      }
+      await testPrisma().quizSession.update({
+        where: { id: session.sessionId },
+        data: { status: "COMPLETED" },
+      });
+
+      const response = await abandon(session);
+      // 结果页可能已经分享出去，订阅也可能挂在这次测评上
+      expect(response.status).toBe(409);
+      expect(response.body.error.code).toBe("SESSION_ALREADY_COMPLETED");
+    });
+
+    it("越权作废返回 404", async () => {
+      const mine = await newSession();
+      const other = await newSession();
+
+      const response = await abandon(mine, other.token);
+      expect(response.status).toBe(404);
+
+      const stored = await testPrisma().quizSession.findUniqueOrThrow({
+        where: { id: mine.sessionId },
+      });
+      expect(stored.status).toBe("IN_PROGRESS");
+    });
+
+    it("作废后仍可读取，用户不会突然看不到自己填过什么", async () => {
+      const session = await newSession();
+      await saveAnswer(session, "gender");
+      await abandon(session);
+
+      const state = await readSession(session);
+      expect(state.status).toBe(200);
+      expect(state.body.status).toBe("ABANDONED");
+      expect(state.body.answers.gender).toEqual({ gender: "FEMALE" });
     });
   });
 

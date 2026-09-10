@@ -221,3 +221,64 @@ export function progressPercent(answered: readonly string[]): number {
   const count = STEP_DEFINITIONS.filter((s) => done.has(s.key)).length;
   return Math.round((count / total) * 100);
 }
+
+// ---------------------------------------------------------------------------
+// 漏斗导航
+//
+// 这几个函数原本散在页面组件里，既没法单测，也和 STEP_DEFINITIONS 里的
+// 步骤顺序各说各话。抽出来之后，导航规则和步骤定义共用同一份真相。
+// ---------------------------------------------------------------------------
+
+/** 步骤在漏斗中的下标。未知步骤返回 -1。 */
+export function stepIndexOf(key: string): number {
+  return STEP_KEYS.indexOf(key as StepKey);
+}
+
+/** 按下标取步骤。越界返回 null，调用方据此判断是否已走完漏斗。 */
+export function stepAtIndex(index: number): StepKey | null {
+  return STEP_KEYS[index] ?? null;
+}
+
+/**
+ * 上一步。已经在第一步时返回 null，
+ * 调用方据此决定返回键是回到上一步还是退出漏斗。
+ */
+export function previousStepOf(key: string): StepKey | null {
+  const index = stepIndexOf(key);
+  if (index <= 0) return null;
+  return stepAtIndex(index - 1);
+}
+
+/**
+ * 恢复落点：用户下次进来该停在哪一步。
+ *
+ * 规则是「已答过的最靠后步骤，再往后一步」，而不是复用 nextStepFor
+ * 的「第一个空缺」。两者语义不同，差别在跳过可选步骤时会暴露：
+ *
+ *   已答 gender、goal、body_metrics（中间的 focus_areas 被跳过了）
+ *   nextStepFor    -> focus_areas   把用户拽回他主动跳过的那一步
+ *   resumeStepFor  -> activity_level 接着他真实的进度往下走
+ *
+ * nextStepFor 仍然服务于服务端的 currentStep 与「还缺哪几步」，不受影响。
+ */
+export function resumeStepFor(answered: readonly string[]): StepKey {
+  const furthest = answered.reduce((max, key) => {
+    const index = stepIndexOf(key);
+    return index > max ? index : max;
+  }, -1);
+
+  // 全部答完时停在最后一步，让用户能确认最后那个选择而不是掉进空白页
+  return stepAtIndex(furthest + 1) ?? STEP_KEYS[STEP_KEYS.length - 1]!;
+}
+
+/**
+ * 按下标计算进度百分比。
+ *
+ * 不用「已答数量 / 总数」：跳过可选步骤的用户永远到不了 100%，
+ * 进度条会停在一个让人以为没填完的数字上。
+ */
+export function stepProgressPercent(index: number): number {
+  const total = STEP_DEFINITIONS.length;
+  const clamped = Math.min(Math.max(index, 0), total);
+  return Math.round((clamped / total) * 100);
+}

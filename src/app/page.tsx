@@ -1,4 +1,4 @@
-import Link from "next/link";
+import { LandingCta } from "@/components/landing-cta";
 
 export const metadata = {
   title: "BetterMe · 你的个人健康计划",
@@ -32,14 +32,11 @@ export default function LandingPage() {
           以及达成目标体重需要多久。
         </p>
 
-        <Link
-          href="/quiz"
-          className="mt-10 block w-full rounded-full bg-accent px-6 py-4 text-center text-base font-semibold text-accent-ink transition-all duration-150 hover:brightness-110 active:scale-[0.99]"
-        >
-          开始测评
-        </Link>
-
-        <p className="mt-4 text-sm text-ink-faint">无需注册，随时可以中断后继续</p>
+        {/*
+          行动区是客户端岛：它要读 localStorage 才知道该显示
+          「开始测评」还是「继续上次测评」。页面其余部分保持静态预渲染。
+        */}
+        <LandingCta />
 
         <dl className="mt-14 grid grid-cols-3 gap-4 border-t border-line pt-8 text-center">
           {[

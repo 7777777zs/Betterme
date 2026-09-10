@@ -5,7 +5,12 @@ import {
   isStepKey,
   missingRequiredSteps,
   nextStepFor,
+  previousStepOf,
   progressPercent,
+  resumeStepFor,
+  stepAtIndex,
+  stepIndexOf,
+  stepProgressPercent,
   stepSchemas,
 } from "@/lib/quiz/steps";
 import { LIMITS } from "@/lib/health/constants";
@@ -77,6 +82,90 @@ describe("进度推算", () => {
     expect(progressPercent(["gender", "hacked", "also_fake"])).toBe(
       progressPercent(["gender"]),
     );
+  });
+});
+
+describe("漏斗导航", () => {
+  it("下标与步骤可以互相还原", () => {
+    for (const step of STEP_DEFINITIONS) {
+      expect(stepAtIndex(stepIndexOf(step.key))).toBe(step.key);
+    }
+  });
+
+  it("未知步骤的下标是 -1，越界下标返回 null", () => {
+    expect(stepIndexOf("nope")).toBe(-1);
+    expect(stepAtIndex(-1)).toBeNull();
+    expect(stepAtIndex(STEP_DEFINITIONS.length)).toBeNull();
+    expect(stepAtIndex(999)).toBeNull();
+  });
+
+  it("第一步没有上一步，供返回键判断该退出漏斗", () => {
+    expect(previousStepOf("gender")).toBeNull();
+  });
+
+  it("其余步骤的上一步就是前一个", () => {
+    expect(previousStepOf("goal")).toBe("gender");
+    expect(previousStepOf("focus_areas")).toBe("goal");
+    expect(previousStepOf("activity_level")).toBe("body_metrics");
+  });
+
+  it("未知步骤没有上一步", () => {
+    expect(previousStepOf("nope")).toBeNull();
+  });
+
+  describe("恢复落点", () => {
+    it("没答过任何步骤时从第一步开始", () => {
+      expect(resumeStepFor([])).toBe("gender");
+    });
+
+    it("答到哪就接着下一步", () => {
+      expect(resumeStepFor(["gender"])).toBe("goal");
+      expect(resumeStepFor(["gender", "goal"])).toBe("focus_areas");
+    });
+
+    it("与传入顺序无关，只看最靠后的那一步", () => {
+      expect(resumeStepFor(["goal", "gender"])).toBe("focus_areas");
+    });
+
+    it("跳过可选步骤后不会被拽回去", () => {
+      // 这是 resumeStepFor 存在的理由：nextStepFor 在这里会返回 focus_areas，
+      // 把用户送回他主动跳过的那一步。
+      const answered = ["gender", "goal", "body_metrics"];
+      expect(nextStepFor(answered)).toBe("focus_areas");
+      expect(resumeStepFor(answered)).toBe("activity_level");
+    });
+
+    it("全部答完时停在最后一步，而不是掉进空白页", () => {
+      expect(resumeStepFor(STEP_DEFINITIONS.map((s) => s.key))).toBe("activity_level");
+    });
+
+    it("混入未知步骤不影响结果", () => {
+      expect(resumeStepFor(["gender", "hacked", "__proto__"])).toBe("goal");
+    });
+  });
+
+  describe("进度百分比", () => {
+    it("按下标推进，首尾为 0 和 100", () => {
+      expect(stepProgressPercent(0)).toBe(0);
+      expect(stepProgressPercent(STEP_DEFINITIONS.length)).toBe(100);
+    });
+
+    it("单调递增", () => {
+      const values = STEP_DEFINITIONS.map((_, i) => stepProgressPercent(i));
+      expect([...values].sort((a, b) => a - b)).toEqual(values);
+    });
+
+    it("越界下标被钳制在 0 到 100 之间", () => {
+      expect(stepProgressPercent(-5)).toBe(0);
+      expect(stepProgressPercent(999)).toBe(100);
+    });
+
+    it("跳过可选步骤的用户仍能走到 100%", () => {
+      // 按已答数量算的话，跳过一步就永远停在 80%，
+      // 进度条会让人以为还没填完。
+      expect(progressPercent(["gender", "goal", "body_metrics", "activity_level"])).toBe(80);
+      expect(stepProgressPercent(STEP_DEFINITIONS.length)).toBe(100);
+    });
   });
 });
 
