@@ -18,7 +18,18 @@ type Ctx = { params: Promise<{ id: string; stepKey: string }> };
  */
 function parseIfMatch(header: string | null): number | undefined {
   if (header === null) return undefined;
+
   const trimmed = header.trim().replace(/^"|"$/g, "");
+
+  // 空的 If-Match 是畸形请求，不是「版本 0」。
+  // 少了这一行，Number("") 会得到 0 而被当成合法版本号放行 ——
+  // 客户端发出一个空头部本意是想加锁，结果拿到的是一次无锁写入。
+  if (trimmed === "") {
+    throw errors.validation([
+      { path: "If-Match", message: "不能为空，应为会话当前的版本号" },
+    ]);
+  }
+
   const parsed = Number(trimmed);
   if (!Number.isInteger(parsed) || parsed < 0) {
     throw errors.validation([

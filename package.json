@@ -16,7 +16,8 @@
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
     "db:studio": "prisma studio",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "env:setup": "node scripts/setup-env.mjs"
   },
   "dependencies": {
     "@prisma/adapter-pg": "^7.10.0",

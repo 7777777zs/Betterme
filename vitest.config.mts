@@ -20,8 +20,11 @@ export default defineConfig({
     setupFiles: ["tests/setup.ts"],
     globalSetup: ["tests/global-setup.ts"],
     fileParallelism: false,
-    testTimeout: 20_000,
-    hookTimeout: 30_000,
+    // 集成测试打的是远端 Supabase（东京），每次 Prisma 调用都是一次跨海往返。
+    // 构造一个「已完成测评」的夹具要六七次往返，两个夹具就逼近半分钟。
+    // CI 里跑的是本地 Postgres 容器，实际耗时只有零头。
+    testTimeout: 90_000,
+    hookTimeout: 90_000,
     coverage: {
       provider: "v8",
       reporter: ["text", "html", "lcov"],
