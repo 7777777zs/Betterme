@@ -201,6 +201,25 @@ model AssessmentResult {
   sessionId String      @unique @map("session_id") @db.Uuid
   session   QuizSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
+  // --- 计算输入快照 ---
+  //
+  // 结果行冗余保存算出它的那组输入，而不是只留一个 sessionId 指回作答表。
+  // 三个理由：
+  // 1. 结果是某一时刻的快照，作答却可以被后续修改。只存引用的话，
+  //    事后就再也无法回答「这个结果当时是用什么算出来的」。
+  // 2. 排查线上算错时，一行就能复现，不必跨表拼装 jsonb。
+  // 3. 这些列是强类型枚举与数值，可以直接做聚合分析；
+  //    jsonb 里的同一份数据做不到。
+
+  gender        Gender
+  goal          FitnessGoal
+  activityLevel ActivityLevel @map("activity_level")
+
+  inputAge          Int     @map("input_age")
+  inputHeightCm     Decimal @map("input_height_cm") @db.Decimal(5, 1)
+  inputWeightKg     Decimal @map("input_weight_kg") @db.Decimal(5, 1)
+  inputGoalWeightKg Decimal @map("input_goal_weight_kg") @db.Decimal(5, 1)
+
   // --- 免费可见 ---
 
   /// 用 Decimal 而非 Float，避免浮点漂移导致同样输入两次算出不同字符串
@@ -228,6 +247,13 @@ model AssessmentResult {
 
   /// 达成目标体重的预测日期
   targetDate DateTime? @map("target_date") @db.Date
+
+  /// 达成目标所需周数。维持体重时为 0。
+  weeksToGoal Int @map("weeks_to_goal")
+
+  /// 实际生效的每周体重变化速率，已被安全上限与热量下限钳制。
+  /// 存下来是为了让「为什么是这个日期」可被解释和复核。
+  effectiveWeeklyRateKg Decimal @map("effective_weekly_rate_kg") @db.Decimal(4, 2)
 
   /// 逐周体重预测曲线，结果页的核心付费价值
   weeklyProjection Json @map("weekly_projection") @db.JsonB
