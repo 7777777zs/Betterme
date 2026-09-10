@@ -29,7 +29,18 @@ export default defineConfig({
       provider: "v8",
       reporter: ["text", "html", "lcov"],
       include: ["src/lib/**/*.ts", "src/app/api/**/*.ts"],
-      exclude: ["src/generated/**", "**/*.d.ts"],
+      exclude: [
+        "src/generated/**",
+        "**/*.d.ts",
+        // 纯类型声明，编译后没有任何运行时代码，计入分母只会稀释真实覆盖率
+        "**/types.ts",
+        // 浏览器端模块。跑在 node 环境的测试碰不到它，
+        // 它的正确性由真实浏览器里的端到端流程保证，不该由 node 测试来背。
+        "src/lib/client/**",
+        // 数据库连接装配。集成测试用 vi.mock 把它换成了 test schema 的客户端，
+        // 所以这个文件在测试里根本不会被执行 —— 它本身也没有业务逻辑可测。
+        "src/lib/db/**",
+      ],
       thresholds: {
         lines: 80,
         functions: 80,
