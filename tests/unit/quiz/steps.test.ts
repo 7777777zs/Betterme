@@ -181,7 +181,8 @@ describe("身体数据校验 · 公制", () => {
   });
 
   it("缺少 unitSystem 时拒绝，而不是猜一个默认值", () => {
-    const { unitSystem: _drop, ...rest } = validMetric;
+    const rest: Record<string, unknown> = { ...validMetric };
+    delete rest.unitSystem;
     expect(stepSchemas.body_metrics.safeParse(rest).success).toBe(false);
   });
 });

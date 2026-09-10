@@ -17,7 +17,9 @@
     "db:deploy": "prisma migrate deploy",
     "db:studio": "prisma studio",
     "typecheck": "tsc --noEmit",
-    "env:setup": "node scripts/setup-env.mjs"
+    "env:setup": "node scripts/setup-env.mjs",
+    "db:seed": "tsx prisma/seed.ts",
+    "pay:curl": "node scripts/pay-curl.mjs"
   },
   "dependencies": {
     "@prisma/adapter-pg": "^7.10.0",
