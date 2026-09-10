@@ -79,10 +79,37 @@ async function request<T>(
 
   const response = await fetch(path, { ...init, headers });
   const text = await response.text();
-  const body: unknown = text ? JSON.parse(text) : null;
+
+  // 先解析 JSON 再判断状态码，是个隐蔽但代价很高的顺序错误。
+  //
+  // 我们的应用层错误一定是 JSON，但请求未必能走到应用层：CDN 的 412、
+  // 网关的 502、边缘节点的限流页面，返回的都是 HTML 或纯文本。
+  // 一旦先 JSON.parse，这些响应会在解析阶段抛出一个语法错误，
+  // 于是所有中间层故障都被压平成一句「网络似乎不太稳定」，
+  // 状态码和真正的错误内容全部丢失 —— 排查时几乎没有线索。
+  //
+  // 所以：先看状态码，再尝试解析，解析失败也要把状态码和原文带出去。
+  let parsed: unknown = null;
+  let parseFailed = false;
+  if (text) {
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parseFailed = true;
+    }
+  }
 
   if (!response.ok) {
-    const err = body as {
+    if (parseFailed) {
+      throw new ApiError(
+        response.status,
+        "NON_JSON_RESPONSE",
+        `服务返回了非预期的响应（HTTP ${response.status}）。这通常来自 CDN 或网关，而不是应用本身。`,
+        [{ path: "body", message: text.slice(0, 200) }],
+      );
+    }
+
+    const err = parsed as {
       error?: { code?: string; message?: string; details?: never; meta?: never };
     } | null;
     throw new ApiError(
@@ -94,7 +121,16 @@ async function request<T>(
     );
   }
 
-  return { data: body as T, headers: response.headers };
+  if (parseFailed) {
+    throw new ApiError(
+      response.status,
+      "NON_JSON_RESPONSE",
+      "服务返回了无法解析的响应",
+      [{ path: "body", message: text.slice(0, 200) }],
+    );
+  }
+
+  return { data: parsed as T, headers: response.headers };
 }
 
 export interface StepDefinitionDto {
@@ -185,7 +221,11 @@ export const api = {
     expectedVersion?: number,
   ): Promise<SaveAnswerResponse> {
     const headers: Record<string, string> = {};
-    if (expectedVersion !== undefined) headers["If-Match"] = String(expectedVersion);
+    // 自定义头而不是标准的 If-Match：CDN 会接管标准条件请求头，
+    // 在请求到达应用之前就返回 412。详见 route handler 里的注释。
+    if (expectedVersion !== undefined) {
+      headers["X-Session-Version"] = String(expectedVersion);
+    }
 
     const { data } = await request<SaveAnswerResponse>(
       `/api/v1/sessions/${session.sessionId}/answers/${stepKey}`,

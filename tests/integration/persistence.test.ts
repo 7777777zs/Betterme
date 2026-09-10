@@ -70,7 +70,9 @@ function saveAnswer(
     buildRequest("PATCH", `/api/v1/sessions/${session.sessionId}/answers/${stepKey}`, {
       body: options.value ?? body[stepKey],
       token: options.token ?? session.token,
-      headers: options.ifMatch === undefined ? {} : { "if-match": options.ifMatch },
+      headers: options.ifMatch === undefined
+          ? {}
+          : { "x-session-version": options.ifMatch },
     }),
     { id: session.sessionId, stepKey },
   );
@@ -152,13 +154,13 @@ describe.skipIf(!hasTestDatabase())("分步保存与进度恢复", () => {
       );
     });
 
-    it("每次保存都递增版本号，并通过 ETag 回带", async () => {
+    it("每次保存都递增版本号，并在响应头回带", async () => {
       const session = await newSession();
       const first = await saveAnswer(session, "gender");
       const second = await saveAnswer(session, "goal");
 
       expect(second.body.version).toBe(first.body.version + 1);
-      expect(second.headers.get("etag")).toBe(String(second.body.version));
+      expect(second.headers.get("x-session-version")).toBe(String(second.body.version));
     });
 
     it("英制输入被换算成公制后落库", async () => {
@@ -411,7 +413,32 @@ describe.skipIf(!hasTestDatabase())("分步保存与进度恢复", () => {
       expect(events).toBe(2);
     });
 
-    it("非法的 If-Match 值被拒绝，而不是当成 0 处理", async () => {
+    it("标准 If-Match 头不参与乐观锁，即使它带着一个过期版本号", async () => {
+      // 这条是回归测试，锁住一个上线后才发现的坑。
+      //
+      // 版本号原本走标准的 If-Match 头，理由是「代理和网关都认识它」。
+      // 结果 Vercel 的边缘节点确实认识 —— 它自己实现了 RFC 7232，
+      // 看到 If-Match 就直接返回 412 纯文本错误页，请求根本到不了应用。
+      //
+      // 现在版本号走自定义头。这条断言保证 If-Match 已经彻底退出这条链路：
+      // 带一个必然冲突的旧版本号，请求也应当照常成功。
+      const session = await newSession();
+      await saveAnswer(session, "gender");
+
+      const response = await call<SaveAnswerBody & ErrorBody>(
+        saveAnswerRoute as never,
+        buildRequest("PATCH", `/api/v1/sessions/${session.sessionId}/answers/goal`, {
+          body: body.goal,
+          token: session.token,
+          headers: { "if-match": "0" },
+        }),
+        { id: session.sessionId, stepKey: "goal" },
+      );
+
+      expect(response.status).toBe(200);
+    });
+
+    it("非法的版本号头被拒绝，而不是当成 0 处理", async () => {
       const session = await newSession();
       for (const value of ["abc", "-1", "1.5", ""]) {
         const response = await saveAnswer(session, "gender", { ifMatch: value });
