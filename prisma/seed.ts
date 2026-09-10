@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { PrismaPg } from "@prisma/adapter-pg";
+import type { Prisma } from "../src/generated/prisma/client";
 import { PrismaClient } from "../src/generated/prisma/client";
 import { hashToken } from "../src/lib/auth/token";
 import { computeAssessment } from "../src/lib/health/algorithm";
@@ -138,11 +139,11 @@ async function seedSession(
         proteinG: output.macros.proteinG,
         carbsG: output.macros.carbsG,
         fatG: output.macros.fatG,
-        warnings: output.warnings,
+        warnings: output.warnings as unknown as Prisma.InputJsonValue,
         targetDate: output.targetDate ? new Date(`${output.targetDate}T00:00:00.000Z`) : null,
         weeksToGoal: output.weeksToGoal,
         effectiveWeeklyRateKg: output.effectiveWeeklyRateKg,
-        weeklyProjection: output.weeklyProjection,
+        weeklyProjection: output.weeklyProjection as unknown as Prisma.InputJsonValue,
         algorithmVersion: output.algorithmVersion,
       },
     });
@@ -190,4 +191,9 @@ async function main(): Promise<void> {
   }
 }
 
-await main();
+// 不用顶层 await：package.json 没有声明 type=module，
+// tsx 会把这个文件转成 CJS，顶层 await 在 CJS 里不合法。
+main().catch((error: unknown) => {
+  console.error("种子脚本失败：", error);
+  process.exitCode = 1;
+});

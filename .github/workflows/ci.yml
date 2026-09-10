@@ -54,6 +54,12 @@ jobs:
       - name: 生成 Prisma 客户端
         run: npx prisma generate
 
+      # Next 16 会为路由、页面、布局生成类型（如 LayoutProps）。
+      # 这些类型平时由 next dev / next build 顺带产出，CI 是干净检出，
+      # 必须先显式生成，否则 tsc 会报「找不到 LayoutProps」。
+      - name: 生成 Next 路由类型
+        run: npx next typegen
+
       - name: 类型检查
         run: npm run typecheck
 
