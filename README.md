@@ -6,7 +6,7 @@
 
 | | |
 |---|---|
-| 线上地址 | 见下方「线上演示」 |
+| 线上地址 | https://betterme-xinjie.vercel.app |
 | 技术栈 | Next.js 16 · TypeScript · Prisma 7 · Supabase Postgres · Vitest |
 | 测试 | 228 例，单元 172 + 集成 56 |
 
@@ -54,7 +54,7 @@ npm run dev
 
 ## 线上演示
 
-> 部署地址：`<待填写>`
+> **https://betterme-xinjie.vercel.app**
 
 ### 对比付费前后的差异化返回
 
@@ -63,11 +63,11 @@ npm run dev
 ```bash
 # 未付费：受保护字段在响应里根本不存在
 curl -H 'Authorization: Bearer demo-free-token-do-not-use-in-production' \
-  '<部署地址>/api/v1/sessions/11111111-1111-4111-8111-111111111111/result'
+  'https://betterme-xinjie.vercel.app/api/v1/sessions/11111111-1111-4111-8111-111111111111/result'
 
 # 已付费：返回目标日期与逐周体重曲线
 curl -H 'Authorization: Bearer demo-paid-token-do-not-use-in-production' \
-  '<部署地址>/api/v1/sessions/22222222-2222-4222-8222-222222222222/result'
+  'https://betterme-xinjie.vercel.app/api/v1/sessions/22222222-2222-4222-8222-222222222222/result'
 ```
 
 未付费响应里没有 `targetDate`、`weeksToGoal`、`effectiveWeeklyRateKg`、`weeklyProjection` 这四个键。注意是**键不存在**，不是值为 `null`，理由见[关键设计决策](#三脱敏用独立-dto-层字段直接不存在)。
@@ -77,13 +77,13 @@ curl -H 'Authorization: Bearer demo-paid-token-do-not-use-in-production' \
 回调签名覆盖请求体的原始字节，手工拼 cURL 极易因为空格或键顺序导致签名不匹配。用脚本生成：
 
 ```bash
-npm run pay:curl -- <sessionId> monthly <部署地址>
+npm run pay:curl -- <sessionId> monthly https://betterme-xinjie.vercel.app
 ```
 
 输出形如：
 
 ```bash
-curl -X POST '<部署地址>/api/v1/pay' \
+curl -X POST 'https://betterme-xinjie.vercel.app/api/v1/pay' \
   -H 'Content-Type: application/json' \
   -H 'X-Signature: <64 位十六进制签名>' \
   -d '{"sessionId":"...","plan":"monthly","idempotencyKey":"evt_..."}'
@@ -363,6 +363,29 @@ npm run test:cov      # 带覆盖率报告
 **数据库故障注入。** 连接中断、事务超时、死锁的恢复行为没有测。这需要故障注入框架，在三天窗口内性价比不足。实际开发中确实遇到过一次远端库连接中断，表现是一批 500，说明这条路径值得加固。
 
 **Supabase 行级安全（RLS）。** 本项目所有访问都经过服务端，客户端不直连数据库，RLS 不在攻击面上。如果将来开放客户端直连，这块必须补。
+
+### 一次真实的性能排查
+
+上线后第一版的分步保存要将近两秒。直觉答案是「数据库在东京，慢是应该的」，但量了才发现是两件事叠加，而且主因不是地理位置本身。
+
+Vercel 的函数默认跑在 `iad1`（美东），数据库在 `ap-northeast-1`（东京）。每一次查询都要跨一次太平洋，实测单次往返 146 毫秒。而一次分步保存内部有九次串行查询（鉴权、版本号递增、读旧 revision、upsert 作答、回读会话、写流水、更新当前步骤，加上事务的开始与提交），九次乘以 146 毫秒就是一秒三。
+
+修法是把函数固定到东京，与数据库同区域，一行配置：
+
+```json
+{ "regions": ["hnd1"] }
+```
+
+| 指标 | 改动前 | 改动后 |
+|---|---|---|
+| 数据库单次往返 | 146ms | 5ms |
+| 分步保存 `PATCH` | 1900ms | 230ms |
+| 进度恢复 `GET` | 1500ms | 222ms |
+| 提交计算 `POST` | 1593ms | 235ms |
+
+改完之后剩下的 230 毫秒里，大部分是客户端到 Vercel 边缘的公网延迟，服务端实际耗时只剩四五十毫秒。
+
+**那九次串行查询没有再优化**，这是有意的取舍。它们现在合计约 45 毫秒，占端到端耗时的两成不到。把它们压成一条带 CTE 的原生 SQL 确实能做到一次往返，但会牺牲 Prisma 的类型安全和这段逻辑的可读性，换来的收益已经淹没在公网延迟里。先量，再决定值不值得，而不是反过来。
 
 ### 覆盖率统计里排除了什么
 
