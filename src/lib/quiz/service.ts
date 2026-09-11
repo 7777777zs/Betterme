@@ -9,6 +9,7 @@ import {
   nextStepFor,
   progressPercent,
   stepSchemas,
+  storedStepSchemas,
 } from "./steps";
 
 const DEFAULT_TTL_HOURS = 720;
@@ -161,24 +162,34 @@ export async function saveAnswer(
   const value = schema.parse(params.rawValue) as Prisma.InputJsonValue;
 
   return prisma.$transaction(async (tx) => {
-    const bump =
-      params.expectedVersion === undefined
-        ? await tx.quizSession.updateMany({
-            where: { id: params.sessionId },
-            data: { version: { increment: 1 } },
-          })
-        : await tx.quizSession.updateMany({
-            where: { id: params.sessionId, version: params.expectedVersion },
-            data: { version: { increment: 1 } },
-          });
+    // 状态条件写进 SQL，而不是只依赖调用前的 assertWritable。
+    //
+    // 那道应用层检查和这里的写入之间存在时间窗：另一个请求可能恰好在
+    // 这期间把会话作废或完成掉。只靠应用层检查的话，就会出现
+    // 「库里标着已放弃，答案却还在增长」这种自相矛盾的记录。
+    // 把状态放进 where 条件，数据库层面就不可能出现这种状态。
+    const bump = await tx.quizSession.updateMany({
+      where: {
+        id: params.sessionId,
+        status: "IN_PROGRESS",
+        ...(params.expectedVersion === undefined
+          ? {}
+          : { version: params.expectedVersion }),
+      },
+      data: { version: { increment: 1 } },
+    });
 
     if (bump.count === 0) {
-      // 要么会话没了，要么版本号对不上。查一次以给出准确的错误。
+      // 影响行数为 0 有四种可能：会话不存在、已作废、已完成、版本不符。
+      // 必须区分开：版本冲突该让客户端拿最新版本重试，
+      // 作废该让它开一个新会话，两者的应对完全不同。
       const current = await tx.quizSession.findUnique({
         where: { id: params.sessionId },
-        select: { version: true },
+        select: { version: true, status: true },
       });
       if (!current) throw errors.sessionNotFound();
+      if (current.status === "ABANDONED") throw errors.sessionAbandoned();
+      if (current.status === "COMPLETED") throw errors.sessionAlreadyCompleted();
       throw errors.versionConflict(current.version);
     }
 
@@ -242,14 +253,19 @@ export async function saveAnswer(
  * 这里再解析一次而不是信任库里的 JSON：作答可能是几个月前写入的，
  * 期间 schema 可能已经改过。用当前 schema 重新解析，
  * 不兼容的历史数据会在提交时明确报错，而不是悄悄算出错误结果。
+ *
+ * 注意用的是 storedStepSchemas 而不是 stepSchemas。
+ * 后者面向 HTTP 原始请求，会按 unitSystem 要求英制字段并做换算；
+ * 但库里存的已经是换算完的公制值，拿入口 schema 去解析必然失败。
+ * 英制用户曾经因此永远走不到结果页，见 storedStepSchemas 的注释。
  */
 export function assembleAssessmentInput(
   answers: Record<string, unknown>,
 ): AssessmentInput {
-  const gender = stepSchemas.gender.parse(answers.gender);
-  const goal = stepSchemas.goal.parse(answers.goal);
-  const body = stepSchemas.body_metrics.parse(answers.body_metrics);
-  const activity = stepSchemas.activity_level.parse(answers.activity_level);
+  const gender = storedStepSchemas.gender.parse(answers.gender);
+  const goal = storedStepSchemas.goal.parse(answers.goal);
+  const body = storedStepSchemas.body_metrics.parse(answers.body_metrics);
+  const activity = storedStepSchemas.activity_level.parse(answers.activity_level);
 
   return {
     gender: gender.gender,
@@ -280,8 +296,15 @@ export async function submitSession(
 
   if (!session) throw errors.sessionNotFound();
 
+  // 已有结果的会话走幂等分支：网络抖动导致的重复点击是常态
   if (session.result) {
     return { resultId: session.result.id, recomputed: false };
+  }
+
+  // 作废的会话不能再算出结果，否则它会从 ABANDONED 变回 COMPLETED，
+  // 相当于用户点了「重新开始」却又被拖回旧会话。
+  if (session.status === "ABANDONED") {
+    throw errors.sessionAbandoned();
   }
 
   const answeredSteps = session.answers.map((a) => a.stepKey);

@@ -12,6 +12,11 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // 以下都是生成产物，不是手写代码，lint 它们只会产生噪音
+    "coverage/**",
+    "src/generated/**",
+    "playwright-report/**",
+    "test-results/**",
   ]),
 ]);
 

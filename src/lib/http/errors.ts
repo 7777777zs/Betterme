@@ -16,6 +16,8 @@ export const ERROR_CODES = {
   SESSION_EXPIRED: "SESSION_EXPIRED",
   /** 会话已完成，不允许再修改作答 */
   SESSION_ALREADY_COMPLETED: "SESSION_ALREADY_COMPLETED",
+  /** 会话已被用户主动作废，不再接受任何写入 */
+  SESSION_ABANDONED: "SESSION_ABANDONED",
   /** 乐观锁版本不匹配，存在并发写入 */
   VERSION_CONFLICT: "VERSION_CONFLICT",
   /** 未知的测评步骤标识 */
@@ -81,6 +83,20 @@ export const errors = {
       ERROR_CODES.SESSION_ALREADY_COMPLETED,
       409,
       "该测评已完成，如需修改请重新开始",
+    ),
+
+  /**
+   * 作废的会话不接受写入。
+   *
+   * 与版本冲突分开报是有意的：版本冲突的正确应对是「拿最新版本重试」，
+   * 作废的正确应对是「开一个新会话」。混成同一个码，客户端会拿着
+   * 当前版本号去无意义地重试，而那个会话永远不会再接受写入。
+   */
+  sessionAbandoned: () =>
+    new AppError(
+      ERROR_CODES.SESSION_ABANDONED,
+      409,
+      "该测评已被放弃，请开始一次新的测评",
     ),
 
   versionConflict: (currentVersion: number) =>

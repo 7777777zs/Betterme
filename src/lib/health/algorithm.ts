@@ -236,31 +236,58 @@ export function computeAssessment(
 
   const desiredDailyDelta = (desiredWeeklyRate * KCAL_PER_KG_FAT) / 7;
 
-  let recommendedCalories: number;
-  let effectiveWeeklyRateKg: number;
+  /**
+   * 摄入与速率必须一起定，三个方向走同一条路径。
+   *
+   * 这里曾经有个 bug：减重分支检查了下限，维持分支取了 max，
+   * 增重分支却什么都没做 —— 它隐含假设「加上盈余之后一定高于下限」。
+   * 当 TDEE 本身极低时（高龄、矮小、低体重、久坐叠加），这个假设不成立，
+   * 算出来的建议摄入会低于项目自己规定的安全下限。
+   *
+   * 更要紧的是：光把最终数字取 max 并不能算修好。摄入一旦被抬高，
+   * 实际热量差就变了，速率和目标日期必须跟着重算，
+   * 否则页面上写着「按这个方案吃」，日期却是按另一套参数算的。
+   */
+  const desiredCalories =
+    direction === -1
+      ? tdee - desiredDailyDelta
+      : direction === 1
+        ? tdee + desiredDailyDelta
+        : tdee;
 
-  if (direction === -1) {
-    const raw = tdee - desiredDailyDelta;
-    if (raw < floor) {
-      // 缺口被安全下限截断。诚实的做法是同时把速率降下来，
-      // 而不是嘴上给出 1200 千卡、日期却还按未截断的缺口算。
-      recommendedCalories = floor;
-      const actualDeficit = Math.max(0, tdee - floor);
-      effectiveWeeklyRateKg = round2((actualDeficit * 7) / KCAL_PER_KG_FAT);
-      pushWarning(
-        "CALORIE_FLOOR_APPLIED",
-        `为保证安全，每日摄入不低于 ${floor} 千卡，达成目标所需时间相应延长。`,
-      );
-    } else {
-      recommendedCalories = Math.round(raw);
-      effectiveWeeklyRateKg = round2(desiredWeeklyRate);
-    }
-  } else if (direction === 1) {
-    recommendedCalories = Math.round(tdee + desiredDailyDelta);
-    effectiveWeeklyRateKg = round2(desiredWeeklyRate);
-  } else {
-    recommendedCalories = Math.max(Math.round(tdee), floor);
+  const floorApplied = desiredCalories < floor;
+  const recommendedCalories = floorApplied ? floor : Math.round(desiredCalories);
+
+  // 按最终摄入与 TDEE 的真实差额反推速率，而不是沿用期望速率
+  const actualDailyDelta = recommendedCalories - tdee;
+  let effectiveWeeklyRateKg =
+    direction === 0
+      ? 0
+      : round2((Math.abs(actualDailyDelta) * 7) / KCAL_PER_KG_FAT);
+
+  // 被抬到下限之后，热量差的方向可能与目标方向相反
+  // （例如想减重，但 TDEE 已低于安全下限，再怎么吃也制造不出缺口）
+  if (direction === -1 && actualDailyDelta >= 0) {
     effectiveWeeklyRateKg = 0;
+  }
+
+  if (floorApplied) {
+    pushWarning(
+      "CALORIE_FLOOR_APPLIED",
+      direction === 1
+        ? `为保证安全，每日摄入不低于 ${floor} 千卡，实际增重速度会快于建议节奏。`
+        : direction === 0
+          ? `你的每日总消耗低于安全摄入下限 ${floor} 千卡。按此方案摄入，体重会缓慢上升而非维持。`
+          : `为保证安全，每日摄入不低于 ${floor} 千卡，达成目标所需时间相应延长。`,
+    );
+  }
+
+  // 下限与速率上限无法同时满足时，明确说出来，而不是闷声输出一个超速方案
+  if (direction === 1 && effectiveWeeklyRateKg > MAX_WEEKLY_GAIN_KG) {
+    pushWarning(
+      "CALORIE_FLOOR_EXCEEDS_TARGET_RATE",
+      `安全摄入下限对应的每周增重约 ${effectiveWeeklyRateKg} 公斤，超过建议的 ${MAX_WEEKLY_GAIN_KG} 公斤。建议在专业人士指导下执行。`,
+    );
   }
 
   // TDEE 本身已低于安全下限（高龄、极低体重、久坐叠加），

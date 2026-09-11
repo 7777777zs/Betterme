@@ -6,7 +6,7 @@ import type { ActivityLevel, Gender } from "./types";
  * 存进 assessment_results 后，历史结果能被追溯到具体算法版本：
  * 算法迭代之后，老用户的结果不会被误判成 bug，也支持按版本做 A/B 对比。
  */
-export const ALGORITHM_VERSION = "1.0.0";
+export const ALGORITHM_VERSION = "1.1.0";
 
 /**
  * 每公斤脂肪组织约含 7700 千卡。

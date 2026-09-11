@@ -61,6 +61,15 @@ export type AssessmentWarningCode =
   | "GOAL_BMI_OBESE"
   | "AGGRESSIVE_GOAL"
   | "CALORIE_FLOOR_APPLIED"
+  /**
+   * 安全摄入下限与每周速率上限无法同时满足。
+   *
+   * 极低 TDEE 的增重场景会出现：把摄入抬到安全下限之后，
+   * 实际热量盈余已经超过「每周不超过 0.5 公斤」所对应的量。
+   * 取舍是下限优先 —— 吃低于安全下限是真实的健康风险，
+   * 增得快一点不是 —— 但必须明说，不能闷声输出一个超速方案。
+   */
+  | "CALORIE_FLOOR_EXCEEDS_TARGET_RATE"
   | "GOAL_CONFLICTS_WITH_DIRECTION"
   | "CURRENT_BMI_EXTREME";
 

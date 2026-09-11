@@ -148,12 +148,74 @@ export const focusAreasSchema = z.object({
     .transform((areas) => [...new Set(areas)]),
 });
 
+/**
+ * 已规范化的身体数据 schema，用于校验**来自数据库**的记录。
+ *
+ * 为什么需要和入口 schema 分开：
+ *
+ * 入口 schema 是个判别联合，看 unitSystem 决定该要哪组字段，
+ * 并把英制换算成公制。落库的记录因此长这样：
+ *
+ *   { unitSystem: "IMPERIAL", age, heightCm, weightKg, goalWeightKg }
+ *
+ * 拿入口 schema 去解析它必然失败：判别联合看到 IMPERIAL 就去要
+ * heightIn/weightLb，而 strict 又拒绝已有的公制字段，两头不讨好。
+ * 提交阶段曾经就是这么做的，结果英制用户永远走不到结果页。
+ *
+ * 根子上的混淆是 unitSystem 被赋予了两重身份。这里把它钉死：
+ * **它只是显示偏好**，记录用户当初用的单位以便前端回显；
+ * 它不决定数据库字段的量纲 —— 库里永远是公制。
+ */
+const storedBodyMetrics = z
+  .object({
+    unitSystem: z.enum(["METRIC", "IMPERIAL"]),
+    age: boundedNumber(LIMITS.age.min, LIMITS.age.max, "年龄"),
+    heightCm: boundedNumber(LIMITS.heightCm.min, LIMITS.heightCm.max, "身高"),
+    weightKg: boundedNumber(LIMITS.weightKg.min, LIMITS.weightKg.max, "体重"),
+    goalWeightKg: boundedNumber(
+      LIMITS.goalWeightKg.min,
+      LIMITS.goalWeightKg.max,
+      "目标体重",
+    ),
+  })
+  .strict();
+
+export const storedBodyMetricsSchema = storedBodyMetrics.superRefine((value, ctx) => {
+  // 库里的数据也要过一遍跨字段检查。历史记录可能是旧版本规则写进去的，
+  // 与其拿着不合理的数据去算出一个荒谬结果，不如在提交时明确失败。
+  const deviation = Math.abs(value.goalWeightKg - value.weightKg) / value.weightKg;
+  if (deviation > MAX_GOAL_DEVIATION_RATIO) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["goalWeightKg"],
+      message: `目标体重相对当前体重偏离 ${Math.round(deviation * 100)}%，超出允许范围`,
+    });
+  }
+});
+
+/** 入口 schema：校验并规范化来自 HTTP 的原始请求 */
 export const stepSchemas = {
   gender: z.object({ gender: genderSchema }).strict(),
   goal: z.object({ goal: goalSchema }).strict(),
   focus_areas: focusAreasSchema.strict(),
   body_metrics: bodyMetricsSchema,
   activity_level: z.object({ activityLevel: activityLevelSchema }).strict(),
+} as const;
+
+/**
+ * 存储 schema：校验已经落库的规范化记录。
+ *
+ * 只有 body_metrics 的入口形态与存储形态不同，其余步骤两者一致，
+ * 直接复用同一份定义。保留完整的注册表而不是只导出一个 schema，
+ * 是为了以后再有步骤引入转换时，这里有个现成的位置放它，
+ * 而不是又在某个函数里随手拿入口 schema 去解析数据库记录。
+ */
+export const storedStepSchemas = {
+  gender: stepSchemas.gender,
+  goal: stepSchemas.goal,
+  focus_areas: stepSchemas.focus_areas,
+  body_metrics: storedBodyMetricsSchema,
+  activity_level: stepSchemas.activity_level,
 } as const;
 
 export type StepKey = keyof typeof stepSchemas;

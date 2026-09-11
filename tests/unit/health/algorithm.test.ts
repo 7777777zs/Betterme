@@ -391,23 +391,127 @@ describe("热量安全下限", () => {
     expect(clamped.weeksToGoal).toBeGreaterThan(unclamped.weeksToGoal);
   });
 
-  it("建议摄入在任何输入下都不低于对应性别的下限", () => {
+  /**
+   * 这条用例原来叫「建议摄入在任何输入下都不低于对应性别的下限」，
+   * 实际却只遍历了性别，目标固定为 LOSE_WEIGHT、方向固定为减重。
+   * 它只证明了减重分支守住了下限，增重分支其实是敞开的。
+   *
+   * 测试名称过度承诺比没有测试更危险：它会让人以为这块已经守住了，
+   * 于是不会再去看。算法的覆盖率当时是 100%，bug 照样藏在里面 ——
+   * 覆盖率衡量的是代码被执行过，不是行为被验证过。
+   *
+   * 现在真正遍历性别 × 方向的矩阵。
+   */
+  it("三个方向、三种性别下，建议摄入都不低于对应性别的下限", () => {
     const genders = ["MALE", "FEMALE", "OTHER"] as const;
+
+    // 刻意选低 TDEE 的极端身材：高龄、矮小、久坐。
+    // TDEE 越低，「加上盈余就一定高于下限」这个隐含假设越容易破。
+    const directions = [
+      { label: "减重", weightKg: 40, goalWeightKg: 32, goal: "LOSE_WEIGHT" },
+      { label: "维持", weightKg: 35, goalWeightKg: 35, goal: "MAINTAIN_WEIGHT" },
+      { label: "增重", weightKg: 30, goalWeightKg: 35, goal: "GAIN_MUSCLE" },
+    ] as const;
+
     for (const gender of genders) {
-      const result = computeAssessment(
-        {
-          gender,
-          age: LIMITS.age.max,
-          heightCm: LIMITS.heightCm.min,
-          weightKg: 40,
-          goalWeightKg: 32,
-          goal: "LOSE_WEIGHT",
-          activityLevel: "SEDENTARY",
-        },
-        NOW,
-      );
-      expect(result.recommendedCalories).toBeGreaterThanOrEqual(CALORIE_FLOOR[gender]);
+      for (const direction of directions) {
+        const result = computeAssessment(
+          {
+            gender,
+            age: LIMITS.age.max,
+            heightCm: LIMITS.heightCm.min,
+            weightKg: direction.weightKg,
+            goalWeightKg: direction.goalWeightKg,
+            goal: direction.goal,
+            activityLevel: "SEDENTARY",
+          },
+          NOW,
+        );
+
+        expect(
+          result.recommendedCalories,
+          `${gender} / ${direction.label} 的建议摄入低于下限`,
+        ).toBeGreaterThanOrEqual(CALORIE_FLOOR[gender]);
+      }
     }
+  });
+
+  it("低 TDEE 的增重输入：摄入抬到下限，速率与日期同步重算", () => {
+    // 自查报告里的复现输入。改动前这里算出 792 千卡，低于 1200 的下限。
+    const input: AssessmentInput = {
+      gender: "FEMALE",
+      age: 100,
+      heightCm: 90,
+      weightKg: 30,
+      goalWeightKg: 35,
+      goal: "GAIN_MUSCLE",
+      activityLevel: "SEDENTARY",
+    };
+    const result = computeAssessment(input, NOW);
+
+    expect(result.recommendedCalories).toBe(CALORIE_FLOOR.FEMALE);
+    expect(result.warnings.map((w) => w.code)).toContain("CALORIE_FLOOR_APPLIED");
+
+    // 关键：不能只把数字取 max 就完事。摄入抬高之后，实际盈余变大，
+    // 速率必须跟着重算，否则页面上写着「按这个方案吃」，
+    // 而目标日期是按另一套参数算出来的。
+    const expectedRate = ((CALORIE_FLOOR.FEMALE - result.tdee) * 7) / 7700;
+    expect(result.effectiveWeeklyRateKg).toBeCloseTo(expectedRate, 2);
+
+    const weeks = Math.ceil(5 / result.effectiveWeeklyRateKg);
+    expect(result.weeksToGoal).toBe(weeks);
+  });
+
+  it("下限逼出的速率超过建议上限时，明确告警而不是闷声输出", () => {
+    const result = computeAssessment(
+      {
+        gender: "FEMALE",
+        age: 100,
+        heightCm: 90,
+        weightKg: 30,
+        goalWeightKg: 35,
+        goal: "GAIN_MUSCLE",
+        activityLevel: "SEDENTARY",
+      },
+      NOW,
+    );
+
+    // 安全下限与速率上限在这组输入下无法同时满足。
+    // 取舍是下限优先，但必须说出来。
+    expect(result.effectiveWeeklyRateKg).toBeGreaterThan(0.5);
+    expect(result.warnings.map((w) => w.code)).toContain(
+      "CALORIE_FLOOR_EXCEEDS_TARGET_RATE",
+    );
+  });
+
+  it("维持体重时若下限高于 TDEE，说明「维持」已不成立，给出告警", () => {
+    const result = computeAssessment(
+      {
+        gender: "FEMALE",
+        age: 100,
+        heightCm: 90,
+        weightKg: 30,
+        goalWeightKg: 30,
+        goal: "MAINTAIN_WEIGHT",
+        activityLevel: "SEDENTARY",
+      },
+      NOW,
+    );
+
+    expect(result.recommendedCalories).toBe(CALORIE_FLOOR.FEMALE);
+    expect(result.recommendedCalories).toBeGreaterThan(result.tdee);
+    expect(result.warnings.map((w) => w.code)).toContain("CALORIE_FLOOR_APPLIED");
+  });
+
+  it("正常身材的增重不受下限影响，速率仍是建议上限", () => {
+    // 确认上面的钳制只在极端输入下生效，没有殃及常规路径
+    const result = computeAssessment(
+      withInput({ weightKg: 65, goalWeightKg: 72, goal: "GAIN_MUSCLE" }),
+      NOW,
+    );
+    expect(result.recommendedCalories).toBeGreaterThan(result.tdee);
+    expect(result.effectiveWeeklyRateKg).toBe(0.5);
+    expect(result.warnings.map((w) => w.code)).not.toContain("CALORIE_FLOOR_APPLIED");
   });
 });
 

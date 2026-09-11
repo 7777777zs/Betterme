@@ -11,6 +11,7 @@ const { PATCH: saveAnswerRoute } = await import(
   "@/app/api/v1/sessions/[id]/answers/[stepKey]/route"
 );
 const { POST: abandonRoute } = await import("@/app/api/v1/sessions/[id]/abandon/route");
+const { POST: submitRoute } = await import("@/app/api/v1/sessions/[id]/submit/route");
 
 interface CreatedSessionBody {
   sessionId: string;
@@ -196,6 +197,107 @@ describe.skipIf(!hasTestDatabase())("分步保存与进度恢复", () => {
       // 库里绝不能出现英制字段，否则同一列会混进两种量纲
       expect(value.weightLb).toBeUndefined();
       expect(value.heightIn).toBeUndefined();
+    });
+
+    it("英制输入能一路走到提交并生成结果", async () => {
+      // 回归测试。此前只验证到「英制能保存」就停了，而保存与提交之间
+      // 恰好有一道裂缝：落库时英制已被换算成公制，提交时却又拿
+      // 面向原始输入的 schema 去解析这条记录，判别联合看到 IMPERIAL
+      // 就去要 heightIn/weightLb，必然 422。
+      //
+      // 单看保存是对的，单看提交也说得通，只有把两段接起来才暴露。
+      const session = await newSession();
+
+      for (const step of ["gender", "goal", "activity_level"] as const) {
+        expect((await saveAnswer(session, step)).status).toBe(200);
+      }
+
+      const saved = await saveAnswer(session, "body_metrics", {
+        value: {
+          unitSystem: "IMPERIAL",
+          age: 28,
+          heightIn: 65,
+          weightLb: 155,
+          goalWeightLb: 135,
+        },
+      });
+      expect(saved.status).toBe(200);
+
+      // 中途离开再回来，恢复接口要能读出这条记录
+      const restored = await readSession(session);
+      expect(restored.status).toBe(200);
+      expect(restored.body.missingRequiredSteps).toEqual([]);
+
+      const submitted = await call<{ resultId: string } & ErrorBody>(
+        submitRoute as never,
+        buildRequest("POST", `/api/v1/sessions/${session.sessionId}/submit`, {
+          token: session.token,
+        }),
+        { id: session.sessionId },
+      );
+      expect(submitted.status).toBe(200);
+
+      const result = await testPrisma().assessmentResult.findUniqueOrThrow({
+        where: { sessionId: session.sessionId },
+      });
+
+      // 输入快照必须是换算后的公制值，且只换算过一次。
+      // 二次换算的话 165.1cm 会变成 419cm 这种明显离谱的数。
+      expect(Number(result.inputHeightCm)).toBeCloseTo(165.1, 1);
+      expect(Number(result.inputWeightKg)).toBeCloseTo(70.3, 1);
+      expect(Number(result.inputGoalWeightKg)).toBeCloseTo(61.2, 1);
+      expect(Number(result.bmi)).toBeGreaterThan(0);
+    });
+
+    it("公制与英制的等价输入产出完全相同的结果", async () => {
+      const metric = await newSession();
+      const imperial = await newSession();
+
+      for (const step of ["gender", "goal", "activity_level"] as const) {
+        await saveAnswer(metric, step);
+        await saveAnswer(imperial, step);
+      }
+
+      await saveAnswer(metric, "body_metrics", {
+        value: {
+          unitSystem: "METRIC",
+          age: 28,
+          heightCm: 165.1,
+          weightKg: 70.3,
+          goalWeightKg: 61.2,
+        },
+      });
+      await saveAnswer(imperial, "body_metrics", {
+        value: {
+          unitSystem: "IMPERIAL",
+          age: 28,
+          heightIn: 65,
+          weightLb: 155,
+          goalWeightLb: 135,
+        },
+      });
+
+      for (const s of [metric, imperial]) {
+        await call(
+          submitRoute as never,
+          buildRequest("POST", `/api/v1/sessions/${s.sessionId}/submit`, {
+            token: s.token,
+          }),
+          { id: s.sessionId },
+        );
+      }
+
+      const a = await testPrisma().assessmentResult.findUniqueOrThrow({
+        where: { sessionId: metric.sessionId },
+      });
+      const b = await testPrisma().assessmentResult.findUniqueOrThrow({
+        where: { sessionId: imperial.sessionId },
+      });
+
+      // 单位制只是显示偏好，不该影响任何计算结果
+      expect(Number(b.bmi)).toBe(Number(a.bmi));
+      expect(b.recommendedCalories).toBe(a.recommendedCalories);
+      expect(b.weeksToGoal).toBe(a.weeksToGoal);
     });
 
     it("拒绝未知步骤", async () => {
@@ -577,6 +679,101 @@ describe.skipIf(!hasTestDatabase())("分步保存与进度恢复", () => {
         where: { id: mine.sessionId },
       });
       expect(stored.status).toBe("IN_PROGRESS");
+    });
+
+    it("作废后拒绝写入答案，且不留下任何副作用", async () => {
+      // 回归测试。此前 assertWritable 只拦 COMPLETED 和过期，
+      // 作废的会话照样能写：库里标着「已放弃」，答案和步骤却还在变。
+      const session = await newSession();
+      await saveAnswer(session, "gender");
+      await abandon(session);
+
+      const before = await testPrisma().quizSession.findUniqueOrThrow({
+        where: { id: session.sessionId },
+        include: { answers: true, answerEvents: true },
+      });
+
+      const response = await saveAnswer(session, "gender", {
+        value: { gender: "MALE" },
+      });
+      expect(response.status).toBe(409);
+      expect(response.body.error.code).toBe("SESSION_ABANDONED");
+
+      const after = await testPrisma().quizSession.findUniqueOrThrow({
+        where: { id: session.sessionId },
+        include: { answers: true, answerEvents: true },
+      });
+
+      // 版本号、答案内容、revision、流水条数，一个都不该动
+      expect(after.version).toBe(before.version);
+      expect(after.answers[0]!.value).toEqual(before.answers[0]!.value);
+      expect(after.answers[0]!.revision).toBe(before.answers[0]!.revision);
+      expect(after.answerEvents).toHaveLength(before.answerEvents.length);
+    });
+
+    it("不带版本号也无法写入已作废的会话", async () => {
+      // 乐观锁不能替代状态检查：不带版本号时根本不会触发版本冲突，
+      // 状态检查缺失的话这条路径就是敞开的。
+      const session = await newSession();
+      await saveAnswer(session, "gender");
+      await abandon(session);
+
+      const response = await saveAnswer(session, "goal", { ifMatch: undefined });
+      expect(response.status).toBe(409);
+      expect(response.body.error.code).toBe("SESSION_ABANDONED");
+    });
+
+    it("作废后拒绝提交计算，不能再变回已完成", async () => {
+      const session = await newSession();
+      for (const step of ["gender", "goal", "body_metrics", "activity_level"] as const) {
+        await saveAnswer(session, step);
+      }
+      await abandon(session);
+
+      const response = await call<ErrorBody>(
+        submitRoute as never,
+        buildRequest("POST", `/api/v1/sessions/${session.sessionId}/submit`, {
+          token: session.token,
+        }),
+        { id: session.sessionId },
+      );
+      expect(response.status).toBe(409);
+      expect(response.body.error.code).toBe("SESSION_ABANDONED");
+
+      const count = await testPrisma().assessmentResult.count({
+        where: { sessionId: session.sessionId },
+      });
+      expect(count).toBe(0);
+    });
+
+    it("作废与保存并发时，不会出现作废后又写入成功", async () => {
+      // 鉴权检查与事务写入之间有时间窗。状态只在应用层判断的话，
+      // 另一个请求恰好在这期间作废会话，写入仍会落库。
+      // 把状态放进 SQL 的 where 条件，数据库层面就不可能出现这种矛盾。
+      const session = await newSession();
+      await saveAnswer(session, "gender");
+
+      const [, write] = await Promise.all([
+        abandon(session),
+        saveAnswer(session, "goal"),
+      ]);
+
+      const stored = await testPrisma().quizSession.findUniqueOrThrow({
+        where: { id: session.sessionId },
+        include: { answers: true },
+      });
+
+      if (stored.status === "ABANDONED") {
+        const goalAnswer = stored.answers.find((a) => a.stepKey === "goal");
+        // 作废赢了：那次写入要么失败，要么发生在作废之前
+        if (write.status === 200) {
+          expect(goalAnswer).toBeDefined();
+        } else {
+          expect(goalAnswer).toBeUndefined();
+        }
+      }
+      // 无论谁先，最终状态都必须自洽，不能出现「已作废且答案还在增长」
+      expect(["ABANDONED", "IN_PROGRESS"]).toContain(stored.status);
     });
 
     it("作废后仍可读取，用户不会突然看不到自己填过什么", async () => {

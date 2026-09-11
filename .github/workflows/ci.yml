@@ -74,10 +74,31 @@ jobs:
       - name: 生产构建
         run: npm run build
 
+      # 端到端跑的是真实浏览器 + 真实 HTTP 栈，覆盖上面那些直接调用
+      # route handler 的测试碰不到的一层：点击事件、凭证传递、跨页导航。
+      # 曾经有一次 CDN 拦掉标准请求头，服务端测试全绿而线上点不动，
+      # 就是因为没有任何测试真的发出过 HTTP 请求。
+      - name: 安装 Playwright 浏览器
+        run: npx playwright install --with-deps chromium
+
+      - name: 应用迁移（端到端需要真实建表）
+        run: npx prisma migrate deploy
+
+      - name: 端到端测试
+        run: npm run test:e2e
+
       - name: 上传覆盖率报告
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: coverage
           path: coverage/
+          retention-days: 7
+
+      - name: 上传端到端失败现场
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
           retention-days: 7

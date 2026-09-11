@@ -58,10 +58,26 @@ export async function authenticateSession(
   };
 }
 
-/** 会话是否仍可写入。读取历史进度不受过期限制，写入受限。 */
+/**
+ * 会话是否仍可写入。读取历史进度不受限制，写入只允许 IN_PROGRESS。
+ *
+ * 这里用「白名单」而不是逐个排除终态：`SessionStatus` 以后再加值时，
+ * 排除式写法会默认放行新状态，白名单式写法会默认拒绝。
+ * 对写入路径来说，默认拒绝才是安全的那一边。
+ *
+ * 注意这只是第一道闸。鉴权检查与事务写入之间存在时间窗，
+ * 另一个请求可能恰好在这期间把会话作废掉，所以 saveAnswer 的
+ * 更新语句里还有一道 `status = IN_PROGRESS` 的条件。
+ */
 export function assertWritable(session: QuizSession, now: Date = new Date()): void {
   if (session.status === "COMPLETED") {
     throw errors.sessionAlreadyCompleted();
+  }
+  if (session.status === "ABANDONED") {
+    throw errors.sessionAbandoned();
+  }
+  if (session.status !== "IN_PROGRESS") {
+    throw errors.sessionAbandoned();
   }
   if (session.expiresAt.getTime() <= now.getTime()) {
     throw errors.sessionExpired();

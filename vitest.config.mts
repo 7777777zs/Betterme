@@ -17,6 +17,8 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["tests/**/*.test.ts"],
+    // e2e 用 Playwright 跑，两套 runner 不能互相扫到对方的文件
+    exclude: ["tests/e2e/**"],
     setupFiles: ["tests/setup.ts"],
     globalSetup: ["tests/global-setup.ts"],
     fileParallelism: false,
